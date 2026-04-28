@@ -33,8 +33,8 @@ The dataset contains:
 ### Step 1: Clone the Repository
 
 ```bash
-git clone <repository-url>
-cd UGPGUnetPlus
+git clone https://github.com/tridang04022004/UG-PG-U-Net
+cd UG-PG-U-Net
 ```
 
 ### Step 2: Create Virtual Environment
