@@ -6,7 +6,7 @@ A deep learning model for nuclei segmentation combining progressive growing trai
 
 This project is built upon the progressive growing backbone of:
 
-- **PGU-Net+**: [Progressive Growing U-Net for Segmentation of the Prostate in Transrectal Ultrasound Images](https://arxiv.org/abs/1911.01062)
+- **PGU-Net+**: [PGU-net+: Progressive Growing of U-net+ for Automated Cervical Nuclei Segmentation](https://arxiv.org/abs/1911.01062)
 
 ## Key Features
 
