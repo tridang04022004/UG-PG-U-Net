@@ -1,0 +1,549 @@
+import os
+import argparse
+from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from math import ceil
+from PIL import Image
+import torchvision.transforms as transforms
+
+from data.dataset import HerlevNucleiDataset
+from unet_model.unet import UNet1, UNet2, UNet3, UNet4
+from unet_model.dice_loss import dice_coeff
+from unet_model.focal_loss import CombinedLoss
+from uncertainty import calculate_uncertainty_map, calculate_uncertainty_stats
+from TTA import predict_with_tta, get_tta_config
+
+
+class IoUPlateauDetector:
+    def __init__(self, patience=7, min_delta=1e-4, min_patience=3):
+        self.patience = max(patience, min_patience)
+        self.min_delta = min_delta
+        self.best_iou = 0.0
+        self.counter = 0
+        self.plateau_triggered = False
+    
+    def step(self, current_iou):
+        if current_iou > self.best_iou + self.min_delta:
+            self.best_iou = current_iou
+            self.counter = 0
+            return False
+        else:
+            self.counter += 1
+            if self.counter >= self.patience and not self.plateau_triggered:
+                self.plateau_triggered = True
+                return True
+            return False
+    
+    def get_status(self):
+        if self.plateau_triggered:
+            return f"TRIGGERED (best IoU: {self.best_iou:.4f})"
+        else:
+            return f"Monitoring ({self.counter}/{self.patience}, best IoU: {self.best_iou:.4f})"
+
+
+def calculate_f1_score(pred, target):
+    tp = torch.sum((pred == 1) & (target == 1)).float()
+    fp = torch.sum((pred == 1) & (target == 0)).float()
+    fn = torch.sum((pred == 0) & (target == 1)).float()
+    
+    precision = tp / (tp + fp + 1e-7)
+    recall = tp / (tp + fn + 1e-7)
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-7)
+    
+    return f1.item(), precision.item(), recall.item()
+
+
+def calculate_iou(pred, target):
+    intersection = torch.sum((pred == 1) & (target == 1)).float()
+    union = torch.sum((pred == 1) | (target == 1)).float()
+    
+    iou = intersection / (union + 1e-7)
+    return iou.item()
+
+
+def calculate_dice_score(pred, target, num_classes=3):
+    dice_scores = []
+    for c in range(num_classes):
+        pred_c = (pred == c).float()
+        target_c = (target == c).float()
+        dice = dice_coeff(pred_c, target_c).item()
+        dice_scores.append(dice)
+    return np.mean(dice_scores)
+
+
+def transfer_weights(old_state_dict, new_state_dict):
+    transferred_dict = new_state_dict.copy()
+    
+    for key in old_state_dict.keys():
+        if key in new_state_dict:
+            old_shape = old_state_dict[key].shape
+            new_shape = new_state_dict[key].shape
+            
+            if old_shape == new_shape:
+                transferred_dict[key] = old_state_dict[key]
+                print(f"  Transferred: {key} {old_shape}")
+            else:
+                print(f"  Skipped (shape mismatch): {key} {old_shape} -> {new_shape}")
+        else:
+            print(f"  Skipped (not in new model): {key}")
+    
+    return transferred_dict
+
+
+class ProgressiveTrainer:
+    def __init__(self, args):
+        self.args = args
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+
+        self.output_dir = Path(args.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.current_stage = 1
+        self.stage_img_sizes = [32, 64, 128, 256]
+        self.stage_models = [UNet1, UNet2, UNet3, UNet4]
+        self.stage_epochs = args.stage_epochs
+        self.max_stage = args.max_stage
+        self.use_uncertainty_guidance = args.use_uncertainty_guidance
+        self.use_tta = args.use_tta
+        self.tta_transforms = get_tta_config(args.tta_mode) if args.use_tta else None
+        
+        self.use_plateau_detection = not args.disable_plateau_detection
+        if self.use_plateau_detection:
+            self.plateau_detector = IoUPlateauDetector(
+                patience=args.plateau_patience,
+                min_delta=args.plateau_min_delta,
+                min_patience=3
+            )
+            self.plateau_boundary_boost = args.plateau_boundary_boost
+            self.plateau_lr_factor = args.plateau_lr_factor
+        else:
+            self.plateau_detector = None
+        
+        self.img_size = self.stage_img_sizes[0]
+        self.load_datasets()
+        
+        print(f"\n=== Stage 1: Starting with UNet1 @ {self.img_size}x{self.img_size} ===")
+        self.model = UNet1(n_channels=3, n_classes=3).to(self.device)
+        
+        self.criterion = CombinedLoss(
+            focal_weight=0.475,
+            dice_weight=0.475,
+            boundary_weight=0.05,
+            focal_gamma=2.0,
+            focal_alpha=None,
+            dice_smooth=1.0,
+            ignore_background=False,
+            boundary_theta=5.0
+        )
+        self.optimizer = optim.RMSprop(
+            self.model.parameters(), 
+            lr=args.lr, 
+            weight_decay=1e-4
+        )
+        
+        self.best_loss = float('inf')
+        self.best_iou = 0.0
+        self.history = {
+            'train_loss': [], 'train_f1': [], 'train_dice': [], 'train_iou': [], 'train_uncertainty': [],
+            'test_loss': [], 'test_f1': [], 'test_dice': [], 'test_iou': [], 'test_uncertainty': [],
+            'epoch': [], 'stage': [], 'img_size': []
+        }
+        
+        self.start_epoch = 0
+        if args.checkpoint:
+            self.load_checkpoint(args.checkpoint)
+    
+    def load_datasets(self):
+        print(f"Loading datasets with image size {self.img_size}x{self.img_size}...")
+        
+        self.train_dataset = HerlevNucleiDataset(
+            self.args.data_dir, 
+            split='train', 
+            img_size=(self.img_size, self.img_size)
+        )
+        self.test_dataset = HerlevNucleiDataset(
+            self.args.data_dir, 
+            split='test', 
+            img_size=(self.img_size, self.img_size)
+        )
+        
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_workers=self.args.num_workers,
+            pin_memory=True
+        )
+        
+        self.test_loader = DataLoader(
+            self.test_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            num_workers=self.args.num_workers,
+            pin_memory=True
+        )
+        
+        print(f"Train: {len(self.train_dataset)} | Test: {len(self.test_dataset)}")
+    
+    def upgrade_model(self, new_stage):
+        print(f"\n{'='*60}")
+        print(f"=== Stage {new_stage}: Upgrading to UNet{new_stage} @ {self.stage_img_sizes[new_stage-1]}x{self.stage_img_sizes[new_stage-1]} ===")
+        print(f"{'='*60}\n")
+        
+        old_state_dict = self.model.state_dict()
+        
+        self.img_size = self.stage_img_sizes[new_stage - 1]
+        new_model = self.stage_models[new_stage - 1](n_channels=3, n_classes=3).to(self.device)
+        
+        print("Transferring weights from previous stage...")
+        new_state_dict = new_model.state_dict()
+        transferred_state_dict = transfer_weights(old_state_dict, new_state_dict)
+        new_model.load_state_dict(transferred_state_dict)
+        
+        self.model = new_model
+        
+        self.load_datasets()
+        
+        base_param_ids = []
+        for key in old_state_dict.keys():
+            if key in transferred_state_dict:
+                if old_state_dict[key].shape == transferred_state_dict[key].shape:
+                    for name, param in self.model.named_parameters():
+                        if key.replace('module.', '') == name:
+                            base_param_ids.append(id(param))
+        
+        new_params = []
+        base_params = []
+        for param in self.model.parameters():
+            if id(param) in base_param_ids:
+                base_params.append(param)
+            else:
+                new_params.append(param)
+        
+        if new_stage < self.max_stage:
+            lr_new = self.args.lr
+            lr_base = self.args.lr * 0.01
+        else:
+            lr_new = self.args.lr
+            lr_base = self.args.lr
+        
+        print(f"New layers LR: {lr_new:.2e} | Transferred layers LR: {lr_base:.2e}")
+        
+        self.optimizer = optim.RMSprop([
+            {'params': new_params, 'lr': lr_new},
+            {'params': base_params, 'lr': lr_base}
+        ], weight_decay=1e-4)
+        
+        self.current_stage = new_stage
+        
+        if self.use_plateau_detection:
+            print(f"Resetting plateau detector for Stage {new_stage}")
+            self.plateau_detector = IoUPlateauDetector(
+                patience=self.args.plateau_patience,
+                min_delta=self.args.plateau_min_delta,
+                min_patience=3
+            )
+    
+    def train_epoch(self):
+        self.model.train()
+        total_loss = 0.0
+        total_f1 = 0.0
+        total_iou = 0.0
+        total_uncertainty = 0.0
+        all_preds = []
+        all_targets = []
+        
+        mode_desc = 'Training (UG)' if self.use_uncertainty_guidance else 'Training'
+        with tqdm(self.train_loader, desc=f'{mode_desc} (Stage {self.current_stage})') as pbar:
+            for images, masks in pbar:
+                images = images.to(self.device)
+                masks = masks.to(self.device)
+                
+                if self.use_uncertainty_guidance:
+                    
+                    # Round 1: Coarse Prediction
+                    outputs1 = self.model(images)
+                    loss1, _, _, _ = self.criterion(outputs1, masks)
+                    
+                    with torch.no_grad():
+                        probs1 = F.softmax(outputs1, dim=1)
+                        U1 = calculate_uncertainty_map(probs1)  # (B, H, W)
+                        attention1 = U1.unsqueeze(1)  # (B, 1, H, W)
+                    
+                    # Round 2: Uncertainty-Guided Refinement
+                    guided_images2 = images * (1.0 + attention1)  # Amplify uncertain regions
+                    outputs2 = self.model(guided_images2)
+                    loss2, _, _, _ = self.criterion(outputs2, masks)
+                    
+                    with torch.no_grad():
+                        probs2 = F.softmax(outputs2, dim=1)
+                        U2 = calculate_uncertainty_map(probs2)
+                        attention2 = U2.unsqueeze(1)
+                    
+                    # Round 3: Final Refinement
+                    guided_images3 = images * (1.0 + attention2)
+                    outputs3 = self.model(guided_images3)
+                    loss3, _, _, _ = self.criterion(outputs3, masks)
+                    
+                    # Progressive weighting: 0.3*L1 + 0.3*L2 + 0.4*L3
+                    combined_loss = 0.3 * loss1 + 0.3 * loss2 + 0.4 * loss3
+                    
+                    # Use final round outputs for metrics
+                    outputs = outputs3
+                    
+                else:
+                    outputs = self.model(images)
+                    combined_loss, focal_loss, dice_loss = self.criterion(outputs, masks)
+                
+                # Backpropagation
+                self.optimizer.zero_grad()
+                combined_loss.backward()
+                self.optimizer.step()
+                
+                total_loss += combined_loss.item()
+                
+                with torch.no_grad():
+                    probs = F.softmax(outputs, dim=1)
+                    preds = torch.argmax(probs, dim=1)
+                    
+                    # Calculate uncertainty map
+                    uncertainty_map = calculate_uncertainty_map(probs)
+                    total_uncertainty += uncertainty_map.mean().item()
+                    
+                    all_preds.append(preds.cpu())
+                    all_targets.append(masks.cpu())
+                    
+                    for c in range(1, 3):
+                        pred_class = (preds == c).float()
+                        target_class = (masks == c).float()
+                        
+                        f1, _, _ = calculate_f1_score(pred_class, target_class)
+                        iou = calculate_iou(pred_class, target_class)
+                        
+                        total_f1 += f1
+                        total_iou += iou
+                
+                pbar.set_postfix({'loss': f'{combined_loss.item():.4f}'})
+        
+        all_preds = torch.cat(all_preds, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        dice_score = calculate_dice_score(all_preds, all_targets)
+        
+        avg_loss = total_loss / len(self.train_loader)
+        avg_f1 = total_f1 / (len(self.train_loader) * 2)
+        avg_iou = total_iou / (len(self.train_loader) * 2)
+        avg_uncertainty = total_uncertainty / len(self.train_loader)
+        
+        return avg_loss, avg_f1, dice_score, avg_iou, avg_uncertainty
+    
+    def evaluate(self):
+        self.model.eval()
+        total_loss = 0.0
+        total_f1 = 0.0
+        total_iou = 0.0
+        total_uncertainty = 0.0
+        all_preds = []
+        all_targets = []
+        
+        eval_desc = f'Evaluating (Stage {self.current_stage})'
+        if self.use_tta:
+            eval_desc += f' [TTA: {len(self.tta_transforms)} transforms]'
+        
+        with torch.no_grad():
+            with tqdm(self.test_loader, desc=eval_desc) as pbar:
+                for images, masks in pbar:
+                    images = images.to(self.device)
+                    masks = masks.to(self.device)
+                    
+                    if self.use_tta:
+                        # Use Test-Time Augmentation for robust predictions
+                        probs, preds = predict_with_tta(
+                            self.model, 
+                            images, 
+                            self.device, 
+                            transforms=self.tta_transforms
+                        )
+                        
+                        # Calculate loss on averaged probabilities
+                        # Convert probs back to logits for loss calculation
+                        outputs = torch.log(probs + 1e-10)  # Log probabilities (approximation)
+                        combined_loss, focal_loss, dice_loss, boundary_loss = self.criterion(outputs, masks)
+                    else:
+                        # Standard inference without TTA
+                        outputs = self.model(images)
+                        combined_loss, focal_loss, dice_loss, boundary_loss = self.criterion(outputs, masks)
+                        
+                        probs = F.softmax(outputs, dim=1)
+                        preds = torch.argmax(probs, dim=1)
+                    
+                    total_loss += combined_loss.item()
+                    
+                    # Calculate uncertainty map
+                    uncertainty_map = calculate_uncertainty_map(probs)
+                    total_uncertainty += uncertainty_map.mean().item()
+                    
+                    all_preds.append(preds.cpu())
+                    all_targets.append(masks.cpu())
+                    
+                    for c in range(1, 3):
+                        pred_class = (preds == c).float()
+                        target_class = (masks == c).float()
+                        
+                        f1, _, _ = calculate_f1_score(pred_class, target_class)
+                        iou = calculate_iou(pred_class, target_class)
+                        
+                        total_f1 += f1
+                        total_iou += iou
+        
+        all_preds = torch.cat(all_preds, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        dice_score = calculate_dice_score(all_preds, all_targets)
+        
+        avg_loss = total_loss / len(self.test_loader)
+        avg_f1 = total_f1 / (len(self.test_loader) * 2)
+        avg_iou = total_iou / (len(self.test_loader) * 2)
+        avg_uncertainty = total_uncertainty / len(self.test_loader)
+        
+        return avg_loss, avg_f1, dice_score, avg_iou, avg_uncertainty
+    
+    def save_checkpoint(self, epoch, is_best=False):
+        checkpoint = {
+            'epoch': epoch,
+            'stage': self.current_stage,
+            'img_size': self.img_size,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'history': self.history,
+            'best_iou': self.best_iou,
+        }
+        
+        latest_path = self.output_dir / 'latest_checkpoint_PG.pt'
+        torch.save(checkpoint, latest_path)
+        
+        stage_path = self.output_dir / f'stage{self.current_stage}_checkpoint.pt'
+        torch.save(checkpoint, stage_path)
+        
+        if is_best:
+            best_path = self.output_dir / 'best_model_PG.pt'
+            torch.save(checkpoint, best_path)
+            print(f"✓ Saved best model (IoU: {self.best_iou:.4f}) to {best_path}")
+
+        self.img_size = checkpoint.get('img_size', 32)
+        
+        model_class = self.stage_models[self.current_stage - 1]
+        self.model = model_class(n_channels=3, n_classes=3).to(self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.history = checkpoint.get('history', self.history)
+        self.best_iou = checkpoint.get('best_iou', 0.0)
+        
+        print(f"Loaded checkpoint from {checkpoint_path}")
+        print(f"Resuming from epoch {self.start_epoch}, stage {self.current_stage}")
+    
+    def train(self):
+        print(f"\n{'='*60}")
+        print(f"Starting Progressive Training for {self.args.epochs} epochs")
+        print(f"Stage duration: {self.stage_epochs} epochs")
+        print(f"Maximum stage: {self.max_stage} ({self.stage_img_sizes[self.max_stage-1]}x{self.stage_img_sizes[self.max_stage-1]})")
+        print(f"Uncertainty Guidance: {'ENABLED' if self.use_uncertainty_guidance else 'DISABLED'}")
+        print(f"Test-Time Augmentation: {'ENABLED' if self.use_tta else 'DISABLED'}")
+        if self.use_tta:
+            print(f"  TTA Transforms: {len(self.tta_transforms)} ({', '.join(self.tta_transforms)})")
+        print(f"IoU Plateau Detection: {'ENABLED' if self.use_plateau_detection else 'DISABLED'}")
+        if self.use_plateau_detection:
+            print(f"  Patience: {self.plateau_detector.patience} epochs | Min delta: {self.plateau_detector.min_delta}")
+            print(f"  Boundary boost: {self.criterion.boundary_weight:.3f} → {self.plateau_boundary_boost:.3f} | LR factor: {self.plateau_lr_factor}")
+        print(f"Total samples - Train: {len(self.train_dataset)}, Test: {len(self.test_dataset)}")
+        print(f"{'='*60}\n")
+        
+        for epoch in range(self.start_epoch, self.args.epochs):
+            target_stage = min(ceil((epoch + 1) / self.stage_epochs), self.max_stage)
+            
+            if target_stage > self.current_stage:
+                self.upgrade_model(target_stage)
+            
+            print(f"\n--- Epoch {epoch + 1}/{self.args.epochs} | Stage {self.current_stage} | Size {self.img_size}x{self.img_size} ---")
+            
+            train_loss, train_f1, train_dice, train_iou, train_uncertainty = self.train_epoch()
+            print(f"Train - Loss: {train_loss:.4f}, F1: {train_f1:.4f}, Dice: {train_dice:.4f}, IoU: {train_iou:.4f}, Uncertainty: {train_uncertainty:.4f}")
+            
+            test_loss, test_f1, test_dice, test_iou, test_uncertainty = self.evaluate()
+            print(f"Test  - Loss: {test_loss:.4f}, F1: {test_f1:.4f}, Dice: {test_dice:.4f}, IoU: {test_iou:.4f}, Uncertainty: {test_uncertainty:.4f}")
+            
+            self.history['epoch'].append(epoch + 1)
+            self.history['stage'].append(self.current_stage)
+            self.history['img_size'].append(self.img_size)
+            self.history['train_loss'].append(train_loss)
+            self.history['train_f1'].append(train_f1)
+            self.history['train_dice'].append(train_dice)
+            self.history['train_iou'].append(train_iou)
+            self.history['train_uncertainty'].append(train_uncertainty)
+            self.history['test_loss'].append(test_loss)
+            self.history['test_f1'].append(test_f1)
+            self.history['test_dice'].append(test_dice)
+            self.history['test_iou'].append(test_iou)
+            self.history['test_uncertainty'].append(test_uncertainty)
+            
+            is_best = test_iou > self.best_iou
+            if is_best:
+                self.best_iou = test_iou
+            
+            self.save_checkpoint(epoch, is_best=is_best)
+            
+            # IoU Plateau Detection: adaptive boundary refinement and LR reduction
+            if self.use_plateau_detection:
+                plateau_triggered = self.plateau_detector.step(test_iou)
+                
+                if plateau_triggered:
+                    print(f"\n{'🔔'*30}")
+                    print(f"🔔 IoU PLATEAU DETECTED at Epoch {epoch + 1}")
+                    print(f"🔔 No improvement for {self.plateau_detector.patience} epochs (best IoU: {self.plateau_detector.best_iou:.4f})")
+                    print(f"{'🔔'*30}")
+                    
+                    # (1) Increase boundary loss weight for boundary refinement
+                    old_boundary_weight = self.criterion.boundary_weight
+                    self.criterion.boundary_weight = self.plateau_boundary_boost
+                    print(f"  ✓ Boundary loss weight: {old_boundary_weight:.3f} → {self.criterion.boundary_weight:.3f}")
+                    
+                    # (2) Reduce learning rate for all parameter groups
+                    for i, param_group in enumerate(self.optimizer.param_groups):
+                        old_lr = param_group['lr']
+                        param_group['lr'] *= self.plateau_lr_factor
+                        print(f"  ✓ LR group {i}: {old_lr:.2e} → {param_group['lr']:.2e}")
+                    print(f"  → Shifting focus to boundary refinement\n")
+                
+                # Log plateau status periodically
+                if (epoch + 1) % 5 == 0 and not self.plateau_detector.plateau_triggered:
+                    print(f"  Plateau detector: {self.plateau_detector.get_status()}")
+        
+        print("\n" + "="*60)
+        print("Training completed!")
+        print("="*60)
+        self.print_summary()
+    
+    def print_summary(self):
+        if len(self.history['epoch']) == 0:
+            return
+        
+        best_idx = np.argmax(self.history['test_dice'])
+        print(f"\n{'='*60}")
+        print("BEST RESULTS")
+        print(f"{'='*60}")
+        print(f"Epoch:     {self.history['epoch'][best_idx]}")
+        print(f"Stage:     {self.history['stage'][best_idx]}")
+        print(f"Img Size:  {self.history['img_size'][best_idx]}x{self.history['img_size'][best_idx]}")
+        print(f"Test Loss: {self.history['test_loss'][best_idx]:.4f}")
+        print(f"Test Dice: {self.history['test_dice'][best_idx]:.4f}")
+        print(f"Test F1:   {self.history['test_f1'][best_idx]:.4f}")
+        print(f"Test IoU:  {self.history['test_iou'][best_idx]:.4f}")
+        print(f"{'='*60}\n")
